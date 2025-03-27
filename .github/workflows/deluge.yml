@@ -1,0 +1,138 @@
+name: Build deluge
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: [ "next", "stable" ]
+        boost_version: [ "1.87.0" ]
+    env:
+      BOOST_PATH: "${{ github.workspace }}/boost"
+      BOOST_VERSION: 1.87.0
+      BOOST_PLATFORM_VERSION: 22.04
+      ARCHITECTURE: "amd64"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout Binaries Repository
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.REPO_PATH }}
+          fetch-depth: 0
+
+      - name: Update packages
+        run: sudo apt-get update --fix-missing
+
+      - name: Install build dependencies
+        uses: tecolicom/actions-use-apt-tools@v1
+        with:
+          tools: jq build-essential g++ autoconf automake libtool curl git autoconf-archive checkinstall dos2unix dstat fontconfig ruby-full libcppunit-dev libcurl4-openssl-dev python3-dev autotools-dev libicu-dev libbz2-dev libfontconfig1 libfontconfig1-dev libncurses5-dev libncursesw5-dev libsigc++-2.0-dev libssl-dev mediainfo pkg-config rar screen sysstat unzip zip zlib1g-dev libboost-tools-dev libboost-dev libboost-all-dev libboost-system-dev ninja-build cmake python3 python3-pip python3-setuptools python3-wheel libxkbcommon-x11-dev libxcb-cursor-dev libgtk-3-dev libcairo2-dev libgirepository1.0-dev gobject-introspection python3-gi python3-gi-cairo python3-yaml yamllint
+          cache: false
+
+      - name: Install boost
+        uses: MarkusJx/install-boost@v2.5.0
+        id: install-boost
+        with:
+          boost_version: ${{ env.BOOST_VERSION }}
+          platform_version: ${{ env.BOOST_PLATFORM_VERSION }}
+          boost_install_dir: ${{ env.BOOST_PATH }}
+
+      - name: Check if a release exists
+        id: check_release
+        run: |
+          LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "release_exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "release_exists=true" >> $GITHUB_OUTPUT
+            echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if asset already exists for deluge
+        id: check_asset
+        run: |
+          ASSET_NAME="deluge_${{ matrix.version }}_${{ env.ARCHITECTURE }}.deb"
+          echo "Looking for asset: $ASSET_NAME"
+          LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          else
+            ASSETS=$(gh release view "$LATEST_TAG" --json assets --jq '.assets[].name')
+            if echo "$ASSETS" | grep -q "$ASSET_NAME"; then
+              echo "skip_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "skip_build=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Skip build if asset exists
+        if: ${{ steps.check_release.outputs.release_exists == 'true' && steps.check_asset.outputs.skip_build == 'true' }}
+        run: echo "Skipping build for Deluge version ${{ matrix.version }} because asset exists."
+
+      - name: Run build_deluge.sh
+        if: ${{ steps.check_release.outputs.release_exists == 'false' || steps.check_asset.outputs.skip_build == 'false' }}
+        run: |
+          chmod +x scripts/build/build_deluge.sh
+          echo "BOOST_ROOT=${{ steps.install-boost.outputs.BOOST_ROOT }}"
+          echo "BOOST_ROOT=${{ steps.install-boost.outputs.BOOST_ROOT }}" >> $GITHUB_ENV
+          echo "using gcc ;" >>~/user-config.jam
+          ln -s ${{ steps.install-boost.outputs.BOOST_ROOT }}/b2 /usr/local/bin/b2
+          b2 crypto=openssl cxxstd=14 release
+          ./scripts/build/build_deluge.sh "${{ matrix.version }}"
+
+      - name: Generate JSON metadata for deluge
+        if: ${{ steps.check_release.outputs.release_exists == 'false' || steps.check_asset.outputs.skip_build == 'false' }}
+        run: |
+          DEB_FILE=$(ls custom_build/pkg_deluge/*.deb | head -n1)
+          if [ -z "$DEB_FILE" ]; then
+            echo "No .deb file found."
+            exit 1
+          fi
+          echo "DEB file: $DEB_FILE"
+          package_id=$(basename "$DEB_FILE" .deb)
+          version="${{ matrix.version }}"
+          # Pour Deluge, nous considérons qu'il y a toujours un build "1build1"
+          build="1build1"
+          checksum=$(sha256sum "$DEB_FILE" | awk '{print $1}')
+          CURRENT_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          category="deluge"
+          # Par convention, la version 2.0.3 est considérée comme "stable", 2.1.1 comme "next"
+          tag=$([[ "${{ matrix.version }}" == "2.0.3" ]] && echo "stable" || echo "next")
+          json_file="${package_id}-${tag}.json"
+          echo "Generating JSON metadata in $json_file..."
+          jq -n \
+            --arg package_id "$package_id" \
+            --arg version "$version" \
+            --arg build "$build" \
+            --arg checksum_sha256 "$checksum" \
+            --arg build_date "$CURRENT_DATE" \
+            --arg category "$category" \
+            --arg tag "$tag" \
+            --argjson distribution '["bookworm"]' \
+            '{
+              package_id: $package_id,
+              version: $version,
+              build: $build,
+              checksum_sha256: $checksum_sha256,
+              build_date: $build_date,
+              category: $category,
+              tag: $tag,
+              distribution: $distribution
+            }' > "$json_file"
+          ls -l "$json_file"
+
+      - name: Upload artifacts
+        if: ${{ steps.check_release.outputs.release_exists == 'false' || steps.check_asset.outputs.skip_build == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deluge-${{ matrix.version }}
+          path: |
+            custom_build/pkg_deluge/*.deb
+            *.json
+          retention-days: 7
